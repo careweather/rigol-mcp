@@ -95,6 +95,7 @@ RIGOL_IP=192.168.1.123
 | `RIGOL_USB_SERIAL` | (unset) | When several Rigol scopes are on USB, pin a specific one by serial number. |
 | `RIGOL_ENABLE_SEND_RAW` | (unset) | Set to `1` to enable the `send_raw` tool (arbitrary SCPI). Off by default — see [Tools](#tools). |
 | `RIGOL_SCREENSHOT_DIR` | `screenshots/` | Directory for saved PNG screenshots |
+| `RIGOL_WAVEFORM_DIR` | `waveforms/` | Parent directory for full acquisition exports |
 
 ### USB connection
 
@@ -184,6 +185,7 @@ For **USB**, replace the `RIGOL_IP` entry in `env` with `"RIGOL_USB": "1"` (see 
 |---|---|
 | `idn` | Identify the instrument — make, model, serial, firmware |
 | `get_scope_state` | Snapshot of all channel configs, timebase, and trigger settings |
+| `get_acquisition_info` | Read-only acquisition status, actual sample rate, memory-depth setting, enabled channels, and implemented transfer modes (DS1000Z acquisition metadata) |
 
 ### Acquisition Control
 
@@ -209,6 +211,74 @@ For **USB**, replace the `RIGOL_IP` entry in `env` with `"RIGOL_USB": "1"` (see 
 | `measure` | Query any single-channel measurement: VMAX, VMIN, VPP, VTOP, VBASE, VAMP, VAVG, VRMS, PVRMS, VUPPER, VMID, VLOWER, VARIANCE, FREQUENCY, PERIOD, PWIDTH, NWIDTH, PDUTY, NDUTY, RTIME, FTIME, OVERSHOOT, PRESHOOT, PSLEWRATE, NSLEWRATE, TVMAX, TVMIN, MAREA, MPAREA, PPULSES, NPULSES, PEDGES, NEDGES |
 | `measure_between` | Query delay or phase between two channels. DS1000Z: RDELAY, FDELAY, RPHASE, FPHASE. DHO: RRDELAY/RFDELAY/FRDELAY/FFDELAY, RRPHASE/RFPHASE/FRPHASE/FFPHASE (DS1000Z names auto-map to the homogeneous-edge DHO equivalents) |
 | `get_waveform` | Download and analyse waveform data (NORM screen buffer: up to 1200 pts on DS1000Z, 1000 on DHO); returns text analysis by default, raw time/voltage arrays with `raw_data=true` |
+| `export_acquisition` | Save complete stopped DS1000Z acquisition memory as binary samples and a JSON manifest; returns paths, counts, timing, and integrity warnings |
+
+### Full acquisition-memory export
+
+`get_waveform(raw_data=true)` changes the response representation only: it still reads
+the NORM screen buffer. For offline filtering or protocol analysis, use
+`export_acquisition` with `{"channels": ["CHAN1", "CHAN2", "CHAN3", "CHAN4"]}`.
+Omit `channels` to export all currently enabled analog channels. `output_dir` optionally
+selects the parent directory on the server's machine. Each export gets a unique subdirectory.
+
+The scope must already report STOP. A single acquisition that has finished is suitable;
+WAIT, RUN, and AUTO are rejected. Stopping is a separate, explicit action. The instrument
+does not expose a capture timestamp or completion history through this API, so STOP
+alone cannot prove that a previous trigger completed. Keep the front panel and other
+SCPI clients idle throughout the export. No run, single, autoscale, channel-enable, or
+acquisition-setting writes are issued by the export.
+
+The tool selects RAW/BYTE through the DS1000Z driver, queries each channel's preamble,
+and streams the complete record in chunks of at most 250,000 samples. It checks range
+readback, binary block lengths, file sizes, stopped status, and metadata consistency.
+Waveform source, mode, format, and range are restored and checked afterward; restoration
+failures appear in the warnings. If a binary read fails or its framing is invalid,
+restoration is skipped and the connection is invalidated: unread binary bytes could
+otherwise be mistaken for SCPI query responses. The tool reports that transfer settings
+were not restored; it does not reconnect or retry that export. DHO memory export is currently unsupported and never
+falls back to the screen buffer. `AUTO` memory depth is reported as a setting; actual
+record lengths come from RAW preambles rather than a presumed installed memory option.
+
+The returned `manifest_path` identifies a JSON file beside `CHAN1.bin`, etc. Samples
+are unsigned 8-bit codes, without a SCPI header. The manifest contains instrument and
+acquisition settings, UTC export timestamps, preambles, channel units and probe factors,
+requested/exported ranges (one-based, inclusive), chunk/sample counts, and completeness.
+Duration is the time between first and last saved sample: `(points - 1) * interval`.
+Each channel has its own trigger-relative time axis; alignment differences are flagged.
+Preamble scaling already includes the configured probe ratio; do not multiply it again.
+Transfer and conversion follow the [Rigol programming guide, waveform commands](https://www.rigol.com/dam/global/downloads/brochures/en/program-guide/oscilloscopes/DS1000Z_ProgrammingGuide_EN.pdf?t=1760982668513).
+
+Read an export locally in Python (NumPy is needed only for this example):
+
+```python
+import json
+from pathlib import Path
+import numpy as np
+
+path = Path("waveforms/acquisition-EXAMPLE/manifest.json")  # use returned manifest_path
+manifest = json.loads(path.read_text(encoding="utf-8"))
+assert manifest["complete"], manifest.get("error")
+channel = manifest["channels"]["CHAN1"]
+codes = np.fromfile(path.parent / channel["file"], dtype=np.uint8)
+assert codes.size == channel["points"]
+p = channel["preamble"]
+times_s = p["xorigin"] + (np.arange(codes.size) - p["xreference"]) * p["xincrement"]
+values = (codes.astype(float) - p["yorigin"] - p["yreference"]) * p["yincrement"]
+# values use channel["settings"]["units"] (normally VOLT).
+```
+
+Interrupted transfers retain validated contiguous chunks and an explicitly incomplete
+manifest. The response reports the failure and saved counts; it never embeds large arrays
+or retries the entire export automatically. A process crash can leave extra bytes beyond
+the last manifest checkpoint: treat incomplete files as partial and use only reported
+counts. File system failures may prevent a final manifest update; initial manifests are
+always marked incomplete. After an export has started, a failed final manifest write
+returns `complete=false`, `manifest_current=false`, `manifest_error`, and the file path.
+`persisted_points` reports the last successful checkpoint, while channel `points` reports
+validated samples written during this attempt. In this case `recovery_manifest` supplies
+the current conversion metadata and counts without any waveform arrays. Preserve that
+response because the on-disk manifest is stale. The original transfer error, if any,
+is retained separately from the manifest error. Sample/time subranges, CSV, and NPZ are not implemented.
 
 ### Cursors
 
@@ -285,7 +355,7 @@ uv run --extra test pytest      # or: uv sync --extra test && uv run pytest
 
 - USB driver setup is platform-specific: **Windows** needs WinUSB (via Zadig) or NI-VISA/UltraSigma; **Linux** needs `libusb` access (a udev rule) or NI-VISA; **macOS** typically works through `libusb` with no setup. The server auto-detects the backend — see [USB connection](#usb-connection). LAN needs no driver setup on any platform.
 - No support for math channels, digital channels (MSO), or protocol decode in the current tools yet — use `send_raw` for those
-- Waveform download uses NORMAL mode (screen buffer — up to 1200 points on DS1000Z, 1000 on DHO); full memory depth (RAW mode, up to 56M on DS1000Z / 50M on DHO) is not yet implemented
+- `get_waveform` uses the NORMAL screen buffer; `export_acquisition` supports full RAW memory on DS1000Z only. Hardware validation against a calibrated signal remains necessary for absolute time/voltage accuracy.
 
 ## License
 

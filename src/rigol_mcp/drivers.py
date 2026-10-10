@@ -17,6 +17,10 @@ than holding a reference, so one instance per family is shared across all connec
 
 import pyvisa
 
+
+class MemoryTransferError(RuntimeError):
+    """A RAW binary transfer failed; its VISA stream may be desynchronized."""
+
 # DS1000Z screen geometry, used for pixel-based cursor positioning. These live here
 # because the pixel addressing is itself a DS1000Z-family trait (DHO addresses cursors
 # in seconds and never touches them).
@@ -53,6 +57,16 @@ class ScopeDriver:
     """
 
     name: str = "generic"
+    memory_chunk_points: int = 0  # zero means full-memory export is unsupported
+
+    def acquisition_info(self, scope) -> dict:
+        raise NotImplementedError(f"Acquisition information is unsupported for {self.name}")
+
+    def prepare_memory(self, scope, channel: str) -> None:
+        raise NotImplementedError(f"RAW export is unsupported for {self.name}")
+
+    def read_memory_chunk(self, scope, start: int, stop: int) -> bytes:
+        raise NotImplementedError(f"RAW export is unsupported for {self.name}")
     # Two-source (delay/phase) item names this family accepts, and aliases mapping the
     # canonical DS1000Z names onto family-specific ones (e.g. RDELAY -> RRDELAY on DHO).
     two_source_items: frozenset[str] = frozenset()
@@ -127,6 +141,48 @@ class DS1000ZDriver(ScopeDriver):
     """Rigol DS1000Z / MSO1000Z series (8-bit)."""
 
     name = "DS1000Z"
+    memory_chunk_points = 250_000
+
+    def acquisition_info(self, scope) -> dict:
+        return {
+            "sample_rate_hz": float(scope.query(":ACQ:SRAT?")),
+            "memory_depth_setting": scope.query(":ACQ:MDEP?").strip(),
+            "acquisition_type": scope.query(":ACQ:TYPE?").strip(),
+            "averages": scope.query(":ACQ:AVER?").strip(),
+        }
+
+    def prepare_memory(self, scope, channel: str) -> None:
+        from rigol_mcp.scope import check_scpi_error
+        scope.write(f":WAV:SOUR {channel}")
+        scope.write(":WAV:MODE RAW")
+        scope.write(":WAV:FORM BYTE")
+        scope.write(":WAV:STAR 1")
+        if err := check_scpi_error(scope):
+            raise RuntimeError(f"Cannot select RAW/BYTE acquisition memory: {err}")
+        if (scope.query(":WAV:MODE?").strip() != "RAW"
+                or scope.query(":WAV:FORM?").strip() != "BYTE"
+                or scope.query(":WAV:SOUR?").strip() != channel):
+            raise RuntimeError("Scope did not accept RAW/BYTE/source; screen fallback is forbidden")
+
+    def read_memory_chunk(self, scope, start: int, stop: int) -> bytes:
+        from rigol_mcp.scope import _read_definite_block, check_scpi_error
+        if not 1 <= stop - start + 1 <= self.memory_chunk_points or start < 1:
+            raise ValueError("Invalid acquisition-memory chunk range")
+        scope.write(f":WAV:STAR {start}")
+        scope.write(f":WAV:STOP {stop}")
+        if err := check_scpi_error(scope):
+            raise RuntimeError(f"Cannot select sample range {start}:{stop}: {err}")
+        if (int(scope.query(":WAV:STAR?")) != start
+                or int(scope.query(":WAV:STOP?")) != stop):
+            raise RuntimeError(f"Scope clamped sample range {start}:{stop}")
+        try:
+            scope.write(":WAV:DATA?")
+            data = _read_definite_block(scope, expected_length=stop - start + 1)
+        except (pyvisa.errors.VisaIOError, OSError, ValueError) as exc:
+            raise MemoryTransferError(f"Binary transfer {start}:{stop} failed: {exc}") from exc
+        if len(data) != stop - start + 1:
+            raise RuntimeError(f"Truncated chunk {start}:{stop}: received {len(data)} samples")
+        return data
     two_source_items = frozenset({"RDELAY", "FDELAY", "RPHASE", "FPHASE"})
 
     @classmethod

@@ -736,7 +736,7 @@ def get_waveform(scope: pyvisa.resources.Resource, channel: str) -> dict:
     }
 
 
-def _read_definite_block(scope: pyvisa.resources.Resource) -> bytes:
+def _read_definite_block(scope: pyvisa.resources.Resource, *, expected_length: int | None = None) -> bytes:
     """Read an IEEE 488.2 definite-length block response (``#N<length><data>\\n``).
 
     The safe way to read this depends on the backend, so dispatch on it. Issue the query
@@ -749,9 +749,11 @@ def _read_definite_block(scope: pyvisa.resources.Resource) -> bytes:
     the parsed header. pyvisa-py (@py, used for WinUSB and LAN sockets) is the opposite:
     read_raw()/query time out on large blocks there, so read by exact byte count instead.
     """
+    # Acquisition exports opt into exact payload/message validation. Existing
+    # screen/screenshot callers retain their original framing behavior.
     if active_backend() == "@ivi":
-        return _read_block_via_message(scope)
-    return _read_block_via_bytecount(scope)
+        return _read_block_via_message(scope, expected_length=expected_length)
+    return _read_block_via_bytecount(scope, expected_length=expected_length)
 
 
 def _parse_definite_block_header(raw: bytes) -> tuple[int, int]:
@@ -759,11 +761,13 @@ def _parse_definite_block_header(raw: bytes) -> tuple[int, int]:
     if raw[0:1] != b"#":
         raise ValueError(f"Expected TMC block header starting with '#', got {raw[:8]!r}")
     n = int(raw[1:2])
+    if not 1 <= n <= 9 or len(raw) < 2 + n:
+        raise ValueError("Invalid or truncated definite-length block header")
     data_length = int(raw[2:2 + n])
     return 2 + n, data_length
 
 
-def _read_block_via_message(scope: pyvisa.resources.Resource) -> bytes:
+def _read_block_via_message(scope: pyvisa.resources.Resource, *, expected_length: int | None = None) -> bytes:
     """Read the block using the backend's native message framing (NI-VISA / USBTMC).
 
     read_raw() reads the complete USBTMC message (it stops on the device's EOM, not on a
@@ -777,6 +781,12 @@ def _read_block_via_message(scope: pyvisa.resources.Resource) -> bytes:
     finally:
         scope.read_termination = saved_read_termination
     start, data_length = _parse_definite_block_header(raw)
+    if expected_length is not None:
+        if data_length != expected_length:
+            raise ValueError(f"Unexpected payload length: expected {expected_length}, header declared {data_length}")
+        # Native VISA supplies message boundaries, so EOM alone is also valid.
+        if raw[start + data_length:] not in (b"", b"\n", b"\r\n"):
+            raise ValueError("Unexpected bytes after acquisition-memory block payload")
     data = raw[start:start + data_length]
     if len(data) != data_length:
         raise ValueError(
@@ -785,7 +795,7 @@ def _read_block_via_message(scope: pyvisa.resources.Resource) -> bytes:
     return data
 
 
-def _read_block_via_bytecount(scope: pyvisa.resources.Resource) -> bytes:
+def _read_block_via_bytecount(scope: pyvisa.resources.Resource, *, expected_length: int | None = None) -> bytes:
     """Read the block by exact byte count (required for the pyvisa-py backend).
 
     PNG data contains 0x0A bytes and large blocks over pyvisa-py USBTMC time out on
@@ -795,8 +805,19 @@ def _read_block_via_bytecount(scope: pyvisa.resources.Resource) -> bytes:
     if prefix[0:1] != b"#":
         raise ValueError(f"Expected TMC block header starting with '#', got {prefix!r}")
     n = int(prefix[1:2])
-    data_length = int(scope.read_bytes(n))
+    if not 1 <= n <= 9:
+        raise ValueError("Invalid definite-length block digit count")
+    length_bytes = scope.read_bytes(n)
+    if len(length_bytes) != n:
+        raise ValueError("Truncated definite-length block header")
+    data_length = int(length_bytes)
+    if expected_length is not None and data_length != expected_length:
+        # Reject a corrupt length before requesting an unbounded read. The caller
+        # must invalidate this connection: the payload is deliberately unread.
+        raise ValueError(f"Unexpected payload length: expected {expected_length}, header declared {data_length}")
     raw = scope.read_bytes(data_length + 1)  # +1 for the trailing newline
+    if len(raw) != data_length + 1:
+        raise ValueError(f"Truncated block: expected {data_length + 1} bytes, received {len(raw)}")
     if raw[-1:] != b'\n':
         raise ValueError(f"Expected \\n after definite-length block, got {raw[-1:]!r}")
     return raw[:-1]

@@ -23,6 +23,7 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 
 from rigol_mcp.waveform_analysis import describe_waveform as _describe_waveform
+from rigol_mcp.memory_export import get_acquisition_info, export_acquisition
 from rigol_mcp.scope import (
     get_scope, invalidate_scope, usb_in_use, active_backend,
     screenshot_png,
@@ -71,7 +72,7 @@ def _send_raw_enabled() -> bool:
     return os.environ.get(_SEND_RAW_ENV, "").strip().lower() not in ("", "0", "false", "no", "off")
 
 
-async def _call(fn, *args, **kwargs):
+async def _call(fn, *args, _retry=True, **kwargs):
     """Call fn(scope, *args, **kwargs) with the cached connection.
 
     Serialises concurrent calls via a lock, enforces a minimum inter-command gap, and
@@ -90,7 +91,7 @@ async def _call(fn, *args, **kwargs):
                     return fn(get_scope(), *args, **kwargs)
                 except _RETRYABLE:
                     invalidate_scope()  # drop the session so the next attempt reconnects
-                    if attempt == _MAX_ATTEMPTS:
+                    if not _retry or attempt == _MAX_ATTEMPTS:
                         raise
                     await asyncio.sleep(_RETRY_BACKOFF)
         finally:
@@ -100,6 +101,32 @@ async def _call(fn, *args, **kwargs):
 @server.list_tools()
 async def list_tools() -> list[types.Tool]:
     tools = [
+        types.Tool(
+            name="get_acquisition_info",
+            description="Read acquisition status, sample rate, memory-depth setting, enabled channels, "
+                        "and implemented transfer modes. Does not arm or stop the scope. AUTO memory "
+                        "depth is a setting; export preambles report actual record lengths.",
+            inputSchema={"type": "object", "properties": {}, "additionalProperties": False},
+        ),
+        types.Tool(
+            name="export_acquisition",
+            description="Export the complete stopped acquisition memory to uint8 binary files and a "
+                        "JSON manifest (DS1000Z). Returns paths and compact integrity/timing summaries. "
+                        "Defaults to all enabled analog channels. Requires STOP; never stops, rearms, "
+                        "enables channels, or falls back to screen data. Keep scope controls untouched "
+                        "during export. Partial transfers are saved and explicitly marked incomplete.",
+            inputSchema={
+                "type": "object", "additionalProperties": False,
+                "properties": {
+                    "channels": {"type": "array", "minItems": 1, "maxItems": 4,
+                                 "uniqueItems": True, "items": {"type": "string",
+                                 "enum": ["CHAN1", "CHAN2", "CHAN3", "CHAN4"]}},
+                    "output_dir": {"type": "string", "description": "Local parent directory; "
+                                   "defaults to RIGOL_WAVEFORM_DIR or waveforms/. A unique export "
+                                   "subdirectory is created; existing captures are never overwritten."},
+                },
+            },
+        ),
         types.Tool(
             name="screenshot",
             description=(
@@ -291,7 +318,9 @@ async def list_tools() -> list[types.Tool]:
                 "Amplitude is judged against the channel's V/div: a trace filling under ~10% of the vertical "
                 "screen is flagged as noise floor and its shape/frequency are not reported, and one filling "
                 "under ~20% gets a low-amplitude warning (reduce V/div and re-capture for a clean signal). "
-                "Set raw_data=true to get the full time/voltage JSON arrays instead. "
+                "Set raw_data=true to get screen time/voltage JSON arrays instead; this flag "
+                "only controls representation, not RAW acquisition memory. Use export_acquisition "
+                "for the complete stopped record. "
                 "If the channel's display is OFF it is auto-enabled first (flagged in the warnings). "
                 "After reading, act on any warnings — if FREQUENCY would be 9.9E37 widen the timebase; "
                 "if edges are not near the DC mean, adjust offset so right edge = N×(period/2) − 6×scale. "
@@ -404,6 +433,16 @@ async def list_tools() -> list[types.Tool]:
 @server.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[types.ContentBlock]:
     global _last_call_time
+    if name == "get_acquisition_info":
+        result = await _call(get_acquisition_info)
+        return [types.TextContent(type="text", text=json.dumps(result, indent=2))]
+    if name == "export_acquisition":
+        unknown = set(arguments) - {"channels", "output_dir"}
+        if unknown:
+            raise ValueError(f"Unsupported export arguments: {sorted(unknown)}; only complete records supported")
+        result = await _call(export_acquisition, channels=arguments.get("channels"),
+                             output_dir=arguments.get("output_dir"), _retry=False)
+        return [types.TextContent(type="text", text=json.dumps(result, indent=2))]
     if name == "screenshot":
         png_bytes = await _call(screenshot_png)
         # pyvisa-py (@py, used with the WinUSB driver) can leave the USBTMC stream in a
