@@ -71,6 +71,64 @@ async def test_call_does_not_retry_non_communication_errors():
     assert invalidated == []               # no reconnect
 
 
+async def test_export_no_retry_option():
+    calls = []
+
+    def fail(scope):
+        calls.append(scope)
+        raise _tmo()
+
+    with pytest.raises(pyvisa.errors.VisaIOError):
+        await srv._call(fail, _retry=False)
+    assert len(calls) == 1
+
+
+async def test_export_tool_routing(monkeypatch):
+    calls = []
+
+    async def fake_call(fn, *args, **kwargs):
+        calls.append((fn, kwargs))
+        return {"manifest_path": "capture/manifest.json", "complete": True}
+
+    monkeypatch.setattr(srv, "_call", fake_call)
+    tools = {t.name for t in await srv.list_tools()}
+    assert {"export_acquisition", "get_acquisition_info"} <= tools
+    result = await srv.call_tool("export_acquisition", {"channels": ["CHAN1"]})
+    assert '"complete": true' in result[0].text
+    assert calls[0][0] is srv.export_acquisition
+    assert calls[0][1]["_retry"] is False
+    with pytest.raises(ValueError, match="only complete records"):
+        await srv.call_tool("export_acquisition", {"start": -1})
+
+
+async def test_acquisition_info_tool_routing(monkeypatch):
+    calls = []
+
+    async def fake_call(fn, *args, **kwargs):
+        calls.append((fn, args, kwargs))
+        return {"status": "WAIT", "supported_transfer_modes": ["screen", "acquisition_memory"]}
+
+    monkeypatch.setattr(srv, "_call", fake_call)
+    result = await srv.call_tool("get_acquisition_info", {})
+    assert '"status": "WAIT"' in result[0].text
+    assert calls == [(srv.get_acquisition_info, (), {})]
+
+
+async def test_partial_export_response_survives_tool_routing(monkeypatch):
+    import json
+    partial = {"complete": False, "manifest_current": False,
+               "manifest_path": "capture/manifest.json", "error": "USB disconnected",
+               "manifest_error": "disk full", "channels": {"CHAN1": {"points": 250000}},
+               "recovery_manifest": {"complete": False}}
+
+    def fake_export(scope, **kwargs):
+        return partial
+
+    monkeypatch.setattr(srv, "export_acquisition", fake_export)
+    result = await srv.call_tool("export_acquisition", {"channels": ["CHAN1"]})
+    assert json.loads(result[0].text) == partial
+
+
 @pytest.mark.parametrize("exc_factory", [
     _tmo,
     lambda: UnicodeDecodeError("utf-8", b"", 0, 1, "boom"),
