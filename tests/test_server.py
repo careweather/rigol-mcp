@@ -2,6 +2,7 @@
 backend-aware screenshot reconnect. VISA access is faked; no hardware involved."""
 
 import time
+import asyncio
 
 import pyvisa
 import pytest
@@ -29,6 +30,97 @@ def _tmo():
 
 async def test_call_returns_result():
     assert await srv._call(lambda scope: f"ok:{scope}") == "ok:FAKE_SCOPE"
+
+
+async def test_disconnect_does_not_open_scope(monkeypatch):
+    def forbidden():
+        pytest.fail("disconnect must not open a scope")
+
+    def disconnect():
+        assert srv._scope_lock.locked()
+        return {"connected": False}
+
+    monkeypatch.setattr(srv, "get_scope", forbidden)
+    monkeypatch.setattr(srv, "disconnect_scope", disconnect)
+    assert "disconnect" in {t.name for t in await srv.list_tools()}
+    result = await srv.call_tool("disconnect", {})
+    assert '"connected": false' in result[0].text
+
+
+async def test_disconnect_waits_until_retries_finish(monkeypatch):
+    # Retry backoff yields while retaining ownership; queued disconnects and
+    # calls must not touch VISA during this interval. No hardware is involved.
+    monkeypatch.setattr(srv, "_scope_lock", asyncio.Lock())
+    monkeypatch.setattr(srv, "_MIN_INTERVAL", 0)
+    backoff_started, release = asyncio.Event(), asyncio.Event()
+    real_sleep = asyncio.sleep
+    events = []
+
+    async def backoff(_):
+        backoff_started.set()
+        await release.wait()
+
+    def operation(scope):
+        assert srv._scope_lock.locked()
+        events.append("operation")
+        if len(events) == 1:
+            raise _tmo()
+
+    def disconnect():
+        assert srv._scope_lock.locked()
+        events.append("disconnect")
+        return {"connected": False}
+
+    monkeypatch.setattr(srv.asyncio, "sleep", backoff)
+    monkeypatch.setattr(srv, "disconnect_scope", disconnect)
+    active = asyncio.create_task(srv._call(operation))
+    await backoff_started.wait()
+    closing = asyncio.create_task(srv.call_tool("disconnect", {}))
+    queued = asyncio.create_task(srv._call(lambda scope: events.append("next")))
+    await real_sleep(0)
+    assert events == ["operation"] and not closing.done() and not queued.done()
+    release.set()
+    await asyncio.gather(active, closing, queued)
+    assert events == ["operation", "operation", "disconnect", "next"]
+
+
+async def test_cancelled_queued_disconnect_never_touches_scope(monkeypatch):
+    monkeypatch.setattr(srv, "_scope_lock", asyncio.Lock())
+
+    def forbidden():
+        pytest.fail("cancelled queued disconnect must not touch scope")
+
+    monkeypatch.setattr(srv, "get_scope", forbidden)
+    monkeypatch.setattr(srv, "disconnect_scope", forbidden)
+    async with srv._scope_lock:
+        task = asyncio.create_task(srv.call_tool("disconnect", {}))
+        await asyncio.sleep(0)
+        assert not task.done()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    assert not srv._scope_lock.locked()
+
+
+async def test_export_cleanup_retains_scope_lock(monkeypatch, tmp_path):
+    from test_memory_export import MemoryScope
+    from rigol_mcp import memory_export as mem
+    scope = MemoryScope()
+    scope.fail_at = 2
+    cleaned = []
+
+    def invalidate():
+        assert srv._scope_lock.locked()
+        cleaned.append(True)
+
+    monkeypatch.setattr(srv, "get_scope", lambda: scope)
+    monkeypatch.setattr(mem, "invalidate_scope", invalidate)
+    result = await srv.call_tool("export_acquisition", {
+        "channels": ["CHAN1"], "output_dir": str(tmp_path),
+    })
+    assert '"complete": false' in result[0].text
+    assert cleaned == [True] and len(scope.reads) == 2
+    assert not srv._scope_lock.locked()
 
 
 async def test_call_retries_then_succeeds():

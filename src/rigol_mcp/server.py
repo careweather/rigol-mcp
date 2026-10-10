@@ -25,7 +25,7 @@ from mcp.server.stdio import stdio_server
 from rigol_mcp.waveform_analysis import describe_waveform as _describe_waveform
 from rigol_mcp.memory_export import get_acquisition_info, export_acquisition
 from rigol_mcp.scope import (
-    get_scope, invalidate_scope, usb_in_use, active_backend,
+    get_scope, invalidate_scope, disconnect_scope, usb_in_use, active_backend,
     screenshot_png,
     get_cursor_mode, set_cursor_mode, set_cursor_positions, get_cursor_values,
     send_raw, check_scpi_error,
@@ -101,6 +101,13 @@ async def _call(fn, *args, _retry=True, **kwargs):
 @server.list_tools()
 async def list_tools() -> list[types.Tool]:
     tools = [
+        types.Tool(
+            name="disconnect",
+            description="Release this server's cached scope connection without opening one or "
+                        "sending acquisition commands. Waits for any current scope operation to "
+                        "finish. A later scope tool may reconnect. Does not disconnect other servers.",
+            inputSchema={"type": "object", "properties": {}, "additionalProperties": False},
+        ),
         types.Tool(
             name="get_acquisition_info",
             description="Read acquisition status, sample rate, memory-depth setting, enabled channels, "
@@ -433,6 +440,12 @@ async def list_tools() -> list[types.Tool]:
 @server.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[types.ContentBlock]:
     global _last_call_time
+    if name == "disconnect":
+        # Deliberately avoid _call: it would open a scope just to disconnect it.
+        async with _scope_lock:
+            result = disconnect_scope()
+            _last_call_time = time.monotonic()
+        return [types.TextContent(type="text", text=json.dumps(result, indent=2))]
     if name == "get_acquisition_info":
         result = await _call(get_acquisition_info)
         return [types.TextContent(type="text", text=json.dumps(result, indent=2))]
