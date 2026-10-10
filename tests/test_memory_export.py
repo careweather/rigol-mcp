@@ -424,3 +424,79 @@ def test_info_reports_unsupported_dialect_without_memory_queries(monkeypatch):
     assert result["supported_transfer_modes"] == ["screen"]
     assert result["dialect"] == "DHO" and result["warnings"]
     assert not scope.written
+
+
+@pytest.mark.parametrize("failure", ["visa", "os", "decode"])
+@pytest.mark.parametrize("stage,points", [
+    ("prepare", 0), ("preamble", 0), ("range_query", 250000),
+    ("range_write", 250000), ("status", 250000), ("final_metadata", 500003),
+    ("restore", 500003),
+])
+def test_transport_failure_stops_all_further_scpi(tmp_path, monkeypatch, failure, stage, points):
+    class FailedSession(MemoryScope):
+        failed = False
+
+        def __init__(self):
+            super().__init__()
+            self.after_failure = []
+
+        def check(self, operation, cmd):
+            if self.failed:
+                self.after_failure.append((operation, cmd))
+            assert not self.failed, f"{operation} after transport failure: {cmd}"
+            matches = {
+                "prepare": operation == "write" and cmd == ":WAV:MODE RAW",
+                "preamble": cmd == ":WAV:PRE?",
+                "range_query": cmd == ":WAV:STAR?" and self.transfer["STAR"] == "250001",
+                "range_write": cmd == ":WAV:STOP 500000",
+                "status": cmd == ":TRIGger:STATus?" and len(self.reads) == 1,
+                "final_metadata": cmd == ":ACQ:SRAT?" and bool(self.reads),
+                "restore": cmd == ":WAV:MODE?" and self.transfer["MODE"] == "NORM" and bool(self.reads),
+            }
+            if matches[stage]:
+                self.failed = True
+                if failure == "visa":
+                    raise pyvisa.errors.VisaIOError(-1073807339)
+                if failure == "os":
+                    raise OSError("USB connection lost")
+                raise UnicodeDecodeError("ascii", b"\xff", 0, 1, "bad response")
+
+        def query(self, cmd):
+            self.check("query", cmd)
+            return super().query(cmd)
+
+        def write(self, cmd):
+            self.check("write", cmd)
+            return super().write(cmd)
+
+    invalidated = []
+    monkeypatch.setattr(mem, "invalidate_scope", lambda: invalidated.append(True))
+    scope = FailedSession()
+    result = mem.export_acquisition(scope, ["CHAN1"], tmp_path)
+    assert scope.failed and invalidated == [True] and scope.after_failure == []
+    assert result["manifest_current"] and not result["transfer_settings_restored"]
+    assert sum(c["points"] for c in result["channels"].values()) == points
+    # A failure only during restoration does not invalidate already verified data.
+    assert result["complete"] == (stage == "restore")
+    assert manifest(result)["complete"] == result["complete"]
+
+
+@pytest.mark.parametrize("query", ["*IDN?", ":TRIGger:STATus?", ":WAV:FORM?"])
+def test_preflight_timeout_discards_connection_without_export(tmp_path, monkeypatch, query):
+    class FailedPreflight(MemoryScope):
+        failed = False
+
+        def query(self, cmd):
+            assert not self.failed
+            if cmd == query:
+                self.failed = True
+                raise pyvisa.errors.VisaIOError(-1073807339)
+            return super().query(cmd)
+
+    invalidated = []
+    monkeypatch.setattr(mem, "invalidate_scope", lambda: invalidated.append(True))
+    scope = FailedPreflight()
+    with pytest.raises(pyvisa.errors.VisaIOError):
+        mem.export_acquisition(scope, ["CHAN1"], tmp_path)
+    assert invalidated == [True] and not scope.written
+    assert not list(tmp_path.iterdir())

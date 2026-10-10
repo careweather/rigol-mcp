@@ -11,8 +11,39 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
+import pyvisa
+
 from rigol_mcp.drivers import MemoryTransferError
 from rigol_mcp.scope import get_driver, get_scope_state, check_scpi_error, invalidate_scope
+
+
+class _ExportSession:
+    """Track transport failures separately from local filesystem failures.
+
+    All operations remain synchronous on the caller's thread. The server holds
+    its scope lock for the entire export, including cleanup.
+    """
+
+    def __init__(self, resource):
+        object.__setattr__(self, "_resource", resource)
+        object.__setattr__(self, "transport_failed", False)
+
+    def __getattr__(self, name):
+        value = getattr(self._resource, name)
+        if name not in ("query", "write", "read_bytes", "read_raw"):
+            return value
+
+        def guarded(*args, **kwargs):
+            try:
+                return value(*args, **kwargs)
+            except (pyvisa.errors.VisaIOError, OSError, UnicodeError):
+                object.__setattr__(self, "transport_failed", True)
+                raise
+
+        return guarded
+
+    def __setattr__(self, name, value):
+        setattr(self._resource, name, value)
 
 
 def get_acquisition_info(scope) -> dict:
@@ -60,6 +91,18 @@ def _require_stopped(scope):
 
 
 def export_acquisition(scope, channels=None, output_dir=None) -> dict:
+    session = _ExportSession(scope)
+    try:
+        return _export_acquisition(session, channels, output_dir)
+    except Exception:
+        # Preflight failures happen before a manifest/transfer exists. Discard a
+        # failed session anyway; never reconnect or retry within this export.
+        if session.transport_failed:
+            invalidate_scope()
+        raise
+
+
+def _export_acquisition(scope, channels=None, output_dir=None) -> dict:
     """Export complete records; intentionally no stop, rearm, or range arguments."""
     if channels is not None:
         if (not isinstance(channels, list) or not channels
@@ -156,16 +199,16 @@ def export_acquisition(scope, channels=None, output_dir=None) -> dict:
             raise RuntimeError("Acquisition settings changed during export; record consistency is unverified")
         manifest["complete"] = True
     except Exception as exc:
-        transfer_failed = isinstance(exc, MemoryTransferError)
+        transfer_failed = scope.transport_failed or isinstance(exc, MemoryTransferError)
         manifest["error"] = f"{type(exc).__name__}: {exc}"
         manifest["warnings"].append("Export incomplete or inconsistent; only validated chunks were saved. "
                                     "Check connection/status before requesting a new export.")
     finally:
         try:
             if transfer_failed:
-                # Do not send queries into a partially consumed binary stream.
+                # Do not send commands after a failed binary or text transaction.
                 # Reconnecting here could attach to a different acquisition.
-                raise RuntimeError("Skipped because the binary transfer failed; VISA stream may be desynchronized")
+                raise RuntimeError("Skipped because scope I/O failed; VISA stream may be desynchronized")
             # Reset the range before changing mode/source (e.g. back to MATH/NORM).
             scope.write(":WAV:STAR 1")
             scope.write(":WAV:STOP 1")

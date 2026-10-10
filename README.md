@@ -186,6 +186,7 @@ For **USB**, replace the `RIGOL_IP` entry in `env` with `"RIGOL_USB": "1"` (see 
 | `idn` | Identify the instrument — make, model, serial, firmware |
 | `get_scope_state` | Snapshot of all channel configs, timebase, and trigger settings |
 | `get_acquisition_info` | Read-only acquisition status, actual sample rate, memory-depth setting, enabled channels, and implemented transfer modes (DS1000Z acquisition metadata) |
+| `disconnect` | Release this server's cached VISA connection without opening one or sending acquisition commands; later scope tools may reconnect |
 
 ### Acquisition Control
 
@@ -232,9 +233,11 @@ The tool selects RAW/BYTE through the DS1000Z driver, queries each channel's pre
 and streams the complete record in chunks of at most 250,000 samples. It checks range
 readback, binary block lengths, file sizes, stopped status, and metadata consistency.
 Waveform source, mode, format, and range are restored and checked afterward; restoration
-failures appear in the warnings. If a binary read fails or its framing is invalid,
-restoration is skipped and the connection is invalidated: unread binary bytes could
-otherwise be mistaken for SCPI query responses. The tool reports that transfer settings
+failures appear in the warnings. If any scope I/O fails, including a text query or
+command write, or a binary block has invalid framing, restoration is skipped and the
+connection is invalidated: a delayed or partial reply could otherwise be mistaken for
+the next SCPI query's response. Local filesystem failures do not by themselves prevent
+restoration. The tool reports when transfer settings
 were not restored; it does not reconnect or retry that export. DHO memory export is currently unsupported and never
 falls back to the screen buffer. `AUTO` memory depth is reported as a setting; actual
 record lengths come from RAW preambles rather than a presumed installed memory option.
@@ -331,6 +334,19 @@ Rigol DS1000Z         ← 192.168.1.123  /  USB
 ```
 
 The VISA connection is cached across tool calls (one connection per server session) and reconnects automatically on communication errors.
+
+Scope I/O is strictly synchronous. One server lock covers each operation, including
+export transfers, restoration, and retry cleanup; disconnect takes that same lock and
+waits for the active operation to finish. There are no background scope workers or
+parallel channel downloads. Cancellation cannot interrupt an in-progress synchronous
+transfer midway through its I/O.
+
+Use `disconnect` when this server should release its cached USB/LAN access. It closes
+the session without clearing the device or changing acquisition settings, and does not
+open a connection when none exists. A later scope tool can reconnect, so avoid queuing
+more scope calls after disconnecting. This lock and disconnect apply to this server
+process only: use one active server/client for a physical instrument. They cannot
+prevent a separate program or another MCP server from accessing the scope.
 
 ## SCPI Transport
 

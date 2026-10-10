@@ -10,6 +10,30 @@ from tests.conftest import FakeScope, FakeResourceManager, make_block
 
 # --------------------------------------------------------------------------- env / transport
 
+def test_disconnect_releases_cached_resources_without_device_commands():
+    scope = FakeScope()
+    rm = FakeResourceManager(scope=scope)
+    sc._scope, sc._rm, sc._driver = scope, rm, drivers.DS1000Z
+    result = sc.disconnect_scope()
+    assert result["disconnected"] and not result["connected"]
+    assert scope.closed and rm.closed
+    assert scope.cleared == 0 and scope.written == []
+    assert sc._scope is sc._rm is sc._driver is None
+    assert not sc.disconnect_scope()["disconnected"]
+
+
+def test_disconnect_does_not_hide_close_failure():
+    class CannotClose(FakeScope):
+        def close(self):
+            raise OSError("close failed")
+
+    scope = CannotClose()
+    sc._scope = scope
+    with pytest.raises(OSError, match="close failed"):
+        sc.disconnect_scope()
+    assert sc._scope is scope  # retained for retry; never claim access was released
+    assert not scope.cleared and not scope.written
+
 @pytest.mark.parametrize("value,expected", [
     ("1", True), ("true", True), ("yes", True), ("on", True), ("anything", True),
     ("0", False), ("false", False), ("no", False), ("off", False), ("", False),

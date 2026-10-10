@@ -242,6 +242,25 @@ def invalidate_scope() -> None:
     _driver = None
 
 
+def disconnect_scope() -> dict:
+    """Release cached VISA access without opening a connection or clearing the device.
+
+    The caller must hold the server's scope lock. A later tool may reconnect.
+    """
+    global _scope, _driver, _rm
+    connected = _scope is not None
+    if _scope is not None:
+        _scope.close()  # keep the reference and propagate failure if close fails
+        _scope = None
+    _driver = None
+    if _rm is not None:
+        _rm.close()
+        _rm = None
+    return {"disconnected": connected, "connected": False,
+            "message": "Cached scope access released; a later scope tool may reconnect."
+            if connected else "No cached scope connection was open."}
+
+
 def get_driver(scope: pyvisa.resources.Resource) -> ScopeDriver:
     """Return the dialect driver for the connected scope.
 
