@@ -225,6 +225,7 @@ async def test_partial_export_response_survives_tool_routing(monkeypatch):
     _tmo,
     lambda: UnicodeDecodeError("utf-8", b"", 0, 1, "boom"),
     lambda: OSError("usb gone"),
+    lambda: ValueError("[Errno 19] No such device (it may have been disconnected)"),
 ])
 async def test_call_retries_each_retryable_type(exc_factory):
     calls = {"n": 0}

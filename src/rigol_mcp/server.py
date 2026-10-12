@@ -63,6 +63,18 @@ _RETRY_BACKOFF = 0.2         # seconds to let a flaky USB link settle before ret
 # arguments, SCPI errors) are bugs/usage errors and must propagate unretried.
 _RETRYABLE = (pyvisa.errors.VisaIOError, UnicodeDecodeError, OSError)
 
+
+def _is_retryable(exc: BaseException) -> bool:
+    """Whether exc is a communication fault rather than a usage error.
+
+    pyvisa-py's USB write re-raises usb.core.USBError as ValueError(str(e)), whose text
+    starts with "[Errno N]". A scope that re-enumerated (replug, power cycle) leaves the
+    cached session failing this way with ENODEV, so those ValueErrors reconnect too.
+    """
+    if isinstance(exc, _RETRYABLE):
+        return True
+    return isinstance(exc, ValueError) and str(exc).startswith("[Errno ")
+
 # send_raw sends arbitrary SCPI and can put the scope in any state, so it is opt-in:
 # it is only advertised and accepted when RIGOL_ENABLE_SEND_RAW is set to a truthy value.
 _SEND_RAW_ENV = "RIGOL_ENABLE_SEND_RAW"
@@ -89,7 +101,9 @@ async def _call(fn, *args, _retry=True, **kwargs):
             for attempt in range(1, _MAX_ATTEMPTS + 1):
                 try:
                     return fn(get_scope(), *args, **kwargs)
-                except _RETRYABLE:
+                except Exception as exc:
+                    if not _is_retryable(exc):
+                        raise
                     invalidate_scope()  # drop the session so the next attempt reconnects
                     if not _retry or attempt == _MAX_ATTEMPTS:
                         raise
