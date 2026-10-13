@@ -213,6 +213,7 @@ For **USB**, replace the `RIGOL_IP` entry in `env` with `"RIGOL_USB": "1"` (see 
 | `measure_between` | Query delay or phase between two channels. DS1000Z: RDELAY, FDELAY, RPHASE, FPHASE. DHO: RRDELAY/RFDELAY/FRDELAY/FFDELAY, RRPHASE/RFPHASE/FRPHASE/FFPHASE (DS1000Z names auto-map to the homogeneous-edge DHO equivalents) |
 | `get_waveform` | Download and analyse waveform data (NORM screen buffer: up to 1200 pts on DS1000Z, 1000 on DHO); returns text analysis by default, raw time/voltage arrays with `raw_data=true` |
 | `export_acquisition` | Save complete stopped DS1000Z acquisition memory as binary samples and a JSON manifest; returns paths, counts, timing, and integrity warnings |
+| `decode_spi` | Decode SPI in software from the last acquisition (acquisition memory when stopped, screen buffer when running): one line per chip-select frame with bit count and MOSI/MISO hex. Takes SCK and optional CS, MOSI, MISO channels, SPI mode, and a logic threshold. Reduce the memory depth to 1.2M points or fewer first |
 
 ### Full acquisition-memory export
 

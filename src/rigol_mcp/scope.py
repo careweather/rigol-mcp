@@ -755,6 +755,59 @@ def get_waveform(scope: pyvisa.resources.Resource, channel: str) -> dict:
     }
 
 
+# DS1000Z serves at most 250 000 BYTE points per :WAV:DATA? in RAW mode.
+_RAW_CHUNK_POINTS = 250_000
+# Larger memory depths take minutes over USB; ask for a shallower acquisition instead.
+_RAW_MAX_POINTS = 1_200_000
+
+
+def get_samples(scope: pyvisa.resources.Resource, channel: str, raw: bool = True) -> dict:
+    """Download one channel as BYTE samples converted to volts.
+
+    raw=True reads the whole acquisition memory, which needs a stopped scope (single or stop).
+    raw=False reads the screen buffer. Channels read from the same acquisition share t0 and dt.
+    """
+    ch = channel.upper()
+    scope.write(f":WAV:SOUR {ch}")
+    scope.write(f":WAV:MODE {'RAW' if raw else 'NORM'}")
+    scope.write(":WAV:FORM BYTE")
+    pre = scope.query(":WAV:PRE?").strip().split(",")
+    points = int(pre[2])
+    x_inc, x_origin, x_ref = float(pre[4]), float(pre[5]), float(pre[6])
+    y_inc, y_origin, y_ref = float(pre[7]), float(pre[8]), float(pre[9])
+    if points > _RAW_MAX_POINTS:
+        raise RuntimeError(
+            f"{ch} holds {points} points; reduce the memory depth (:ACQ:MDEP) to "
+            f"{_RAW_MAX_POINTS} or fewer before decoding."
+        )
+    data = bytearray()
+    start = 1
+    while start <= points:
+        stop = min(start + _RAW_CHUNK_POINTS - 1, points)
+        scope.write(f":WAV:STAR {start}")
+        scope.write(f":WAV:STOP {stop}")
+        chunk = b""
+        deadline = time.monotonic() + _WAVEFORM_DATA_RETRY_S
+        # Right after a mode or source change the scope answers with an empty block until the memory read is ready.
+        while True:
+            scope.write(":WAV:DATA?")
+            chunk = _read_definite_block(scope)
+            if chunk or time.monotonic() >= deadline:
+                break
+            time.sleep(0.5)
+        if not chunk:
+            raise RuntimeError(f"{ch} returned no samples for points {start}-{stop}.")
+        data += chunk
+        start = stop + 1
+    volts = [(b - y_origin - y_ref) * y_inc for b in data]
+    return {
+        "channel": ch,
+        "t0_s": x_origin - x_ref * x_inc,
+        "dt_s": x_inc,
+        "volts": volts,
+    }
+
+
 def _read_definite_block(scope: pyvisa.resources.Resource, *, expected_length: int | None = None) -> bytes:
     """Read an IEEE 488.2 definite-length block response (``#N<length><data>\\n``).
 

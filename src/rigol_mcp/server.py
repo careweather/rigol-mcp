@@ -32,8 +32,11 @@ from rigol_mcp.scope import (
     run, stop, single, autoscale,
     idn, connection_info, set_driver_from_idn,
     measure, measure_between, MEASURE_ITEMS, MEASURE_ITEMS_TWO_SOURCE,
-    get_scope_state, set_channel, set_timebase, set_trigger, get_waveform,
+    get_scope_state, set_channel, set_timebase, set_trigger, get_waveform, get_samples,
 )
+from rigol_mcp import spi_decode
+
+_CHANNELS = ["CHAN1", "CHAN2", "CHAN3", "CHAN4"]
 
 server = Server(
     "rigol-mcp",
@@ -444,6 +447,34 @@ async def list_tools() -> list[types.Tool]:
             ),
             inputSchema={"type": "object", "properties": {}, "required": []},
         ),
+        types.Tool(
+            name="decode_spi",
+            description=(
+                "Decode SPI from the last acquisition and return one line per frame: start time, "
+                "bit count, and MOSI/MISO in hex. The channels are downloaded as samples and decoded "
+                "in software, so the scope's own decoder does not need to be set up. "
+                "Single-trigger first (e.g. on chip select): a stopped scope is read from acquisition "
+                "memory, a running one from the screen buffer only. "
+                "With cs, frames are chip-select spans; without it, frames split at clock gaps. "
+                "Thresholds default to the midpoint of each channel's swing. "
+                "Do not call concurrently with any other rigol tool."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "sck":  {"type": "string", "enum": _CHANNELS, "description": "Clock channel"},
+                    "cs":   {"type": "string", "enum": _CHANNELS, "description": "Chip-select channel (optional)"},
+                    "mosi": {"type": "string", "enum": _CHANNELS, "description": "MOSI channel (optional)"},
+                    "miso": {"type": "string", "enum": _CHANNELS, "description": "MISO channel (optional)"},
+                    "mode": {"type": "integer", "enum": [0, 1, 2, 3], "description": "SPI mode (default 0)"},
+                    "cs_active_low": {"type": "boolean", "description": "Default true"},
+                    "msb_first": {"type": "boolean", "description": "Default true"},
+                    "threshold_v": {"type": ["number", "string"], "description": "Logic threshold for every channel (default: per-channel midpoint)"},
+                    "max_frames": {"type": "integer", "description": "Frames to list (default 64)"},
+                },
+                "required": ["sck"],
+            },
+        ),
     ]
     # send_raw is an arbitrary-SCPI escape hatch — only expose it when explicitly enabled.
     if not _send_raw_enabled():
@@ -625,7 +656,78 @@ async def call_tool(name: str, arguments: dict) -> list[types.ContentBlock]:
         state = await _call(get_scope_state)
         return [types.TextContent(type="text", text=json.dumps(state, indent=2))]
 
+    if name == "decode_spi":
+        return [types.TextContent(type="text", text=await _decode_spi(arguments))]
+
     raise ValueError(f"Unknown tool: {name}")
+
+
+def _trigger_status(scope) -> str:
+    return scope.query(":TRIGger:STATus?").strip()
+
+
+async def _decode_spi(arguments: dict) -> str:
+    roles = {r: arguments[r].upper() for r in ("sck", "cs", "mosi", "miso") if arguments.get(r)}
+    raw = (await _call(_trigger_status)) == "STOP"
+    captured = {}
+    for ch in dict.fromkeys(roles.values()):
+        captured[ch] = await _call(get_samples, ch, raw)
+    first = captured[roles["sck"]]
+    t0, dt = first["t0_s"], first["dt_s"]
+    n = min(len(c["volts"]) for c in captured.values())
+    if n == 0:
+        raise RuntimeError("No samples returned. Single-trigger the scope and retry.")
+    fixed = arguments.get("threshold_v")
+    swing = {}
+    digital = {}
+    for ch, c in captured.items():
+        volts = c["volts"][:n]
+        lo, hi = min(volts), max(volts)
+        threshold = float(fixed) if fixed is not None else (lo + hi) / 2
+        swing[ch] = (lo, hi, threshold)
+        digital[ch] = spi_decode.digitize(volts, threshold, max((hi - lo) * 0.1, 0.05))
+
+    line = lambda role: digital[roles[role]] if role in roles else None
+    mode = int(arguments.get("mode", 0))
+    frames = spi_decode.decode_spi(
+        t0, dt, line("sck"), line("mosi"), line("miso"), line("cs"),
+        mode=mode, cs_active_low=arguments.get("cs_active_low", True),
+    )
+    msb_first = arguments.get("msb_first", True)
+    freq = spi_decode.clock_frequency(line("sck"), dt)
+
+    out = [
+        f"SPI mode {mode}, {'acquisition memory' if raw else 'screen buffer (scope running)'}, "
+        f"{n} samples at {dt * 1e9:.3g} ns, SCK ~{freq / 1e6:.3g} MHz" if freq else
+        f"SPI mode {mode}, {n} samples at {dt * 1e9:.3g} ns, no clock edges on {roles['sck']}",
+    ]
+    for role, ch in roles.items():
+        lo, hi, th = swing[ch]
+        out.append(f"  {role.upper()} {ch}: {lo:.2f} V to {hi:.2f} V, threshold {th:.2f} V")
+    warnings = []
+    if freq and 1 / (freq * dt) < 4:
+        warnings.append("fewer than 4 samples per clock period; shorten the timebase or raise the memory depth")
+    for role, ch in roles.items():
+        lo, hi, _ = swing[ch]
+        if hi - lo < 1.0:
+            warnings.append(f"{role.upper()} {ch} swings only {hi - lo:.2f} V; it may not be connected or driven")
+    max_frames = int(arguments.get("max_frames", 64))
+    out.append(f"{len(frames)} frames")
+    for i, f in enumerate(frames[:max_frames]):
+        parts = [f"{i + 1:3d}  t={f.start_s * 1e6:9.3f} us  {f.bit_count:3d} bits"]
+        if f.mosi_bits:
+            parts.append(f"MOSI {spi_decode.bits_to_hex(f.mosi_bits, msb_first)}")
+        if f.miso_bits:
+            parts.append(f"MISO {spi_decode.bits_to_hex(f.miso_bits, msb_first)}")
+        if f.truncated:
+            parts.append("(cut off by the capture window)")
+        out.append("  ".join(parts))
+    if len(frames) > max_frames:
+        out.append(f"... {len(frames) - max_frames} more")
+    if warnings:
+        out.append("Warnings:")
+        out.extend(f"  {w}" for w in warnings)
+    return "\n".join(out)
 
 
 def main() -> None:
